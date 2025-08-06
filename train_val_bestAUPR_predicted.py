@@ -1,0 +1,466 @@
+
+import os
+import time
+import pickle
+from torch.utils.data import Dataset
+from sklearn.metrics import matthews_corrcoef,  precision_score, recall_score, f1_score,roc_auc_score, average_precision_score,confusion_matrix
+from torch_geometric.utils import dense_to_sparse
+from sklearn.model_selection import KFold
+import dgl
+import torch
+import pandas as pd
+from torch.autograd import Variable
+from torch.utils import data
+
+from model_with_edge_features import MainModel, U_MainModel
+from feature.create_node_feature import create_dataset
+from feature.create_graphs import get_coor_train,get_adj_predicted
+from feature.create_edge import create_dis_matrix,get_edge_attr_train
+from datetime import datetime
+
+import warnings
+warnings.filterwarnings("ignore")
+seed_value = 1995
+th=17
+cuda_index = 1  # 这里可以设置为 0, 1, 2, ... 对应不同的 GPU
+
+# 检查是否有足够的 GPU 设备
+if torch.cuda.is_available() and cuda_index < torch.cuda.device_count():
+    device = torch.device(f"cuda:{cuda_index}")
+else:
+    device = torch.device("cpu")
+    print("CUDA is not available or the specified index is out of range. Falling back to CPU.")
+
+########################修改模型保存路径################################
+# predicted structure
+Model_Path = '/home/mijia/egpdi_evolla/Model/AF3_SC_egnn_gcn2_multihead_8'
+
+features = []
+labels = []
+
+class CustomDataset(Dataset):
+    def __init__(self, features, labels):
+        self.features = features
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, index):
+        return self.features[index], self.labels[index]
+
+# predicted structure
+root_dir = '/home/mijia/egpdi_evolla/af3_data/'
+train_path= root_dir + 'train_186_164.txt'
+test_path= root_dir + 'test_71.txt'
+all_702_path = root_dir +  'all_395.txt'
+pkl_path= root_dir +'dataset_dir_train_186_164_test_71/'+ 'PPIS_residue_feas_PSA.pkl' #加H意味着用HMM特征
+esm2_5120_path= root_dir + 'esm2/'
+dis_path= root_dir + 'dataset_dir_train_186_164_test_71/'+'PPIS_psepos_SC.pkl'
+ProtTrans_path = root_dir +  'prottrans/'
+
+
+query_ids = []
+#读取所有训练集的id
+with open(train_path, 'r') as f:
+    train_text = f.readlines()
+    for i in range(0, len(train_text), 3):
+        query_id = train_text[i].strip()[1:]
+        # if query_id[-1].islower():
+        #     query_id += query_id[-1]
+        query_ids.append(query_id)
+
+
+#创建数据集
+#X,y = create_dataset(query_ids,train_path, test_path,all_702_path, pkl_path,esm2_33_path,esm2_5120_path,ProtTrans_path,mas_path,residue=True,one_hot=True,esm2_33=True,esm_5120=True,prottrans=True,msa=True)
+X,y = create_dataset(query_ids,train_path, test_path,all_702_path, pkl_path,esm2_5120_path,ProtTrans_path,residue=True,one_hot=True,esm_5120=True,prottrans=True)
+distance_matrixs=create_dis_matrix(dis_path,query_ids)
+# distance_matrixs = []
+# for i in query_ids:
+#    distance_matrix = create_dis_matrix_by_pdb(pdb_folder_path + i + '.pdb')
+#    distance_matrixs = distance_matrixs.append(distance_matrix)
+
+X_train = X[:324]
+X_test = X[324:]
+
+y_train = y[:324]
+y_test = y[324:]
+
+NUMBER_EPOCHS = 30
+
+# final model parameters
+# dr=0.3,lr=0.0001,nlayers=4,lamda=1.1,alpha=0.1,atten_time=8, bestAUPR model
+
+dr=0.3
+lr=0.0001
+nlayers=4
+#nlayers=5
+lamda=1.1
+alpha=0.1
+atten_time=8
+
+IDs = query_ids[:324]######################
+sequences = []
+labels = []
+
+with open(all_702_path,'r') as f:
+    train_text = f.readlines()
+    for i in range(0, len(train_text), 3):
+        seq = train_text[i+1].strip()
+        label = train_text[i+2].strip()
+        sequences.append(seq)
+        labels.append(label)
+
+sequences = sequences[:324]
+
+labels = y_train
+features = X_train
+#三维坐标
+coors = get_coor_train(dis_path, query_ids)
+#这里是边集，来源是create_graphs.py中调用create_adj_predict.py建立的边集./dataset_dir_train_186_164_test_71/adj_SC_17_predicted中的各个边集合建立的
+adjs = get_adj_predicted(IDs)
+
+#这里是图，用的是adjs中所有的边构建了图
+graphs = []
+for adj in adjs:
+    edge_index, _ = dense_to_sparse(adj)
+    G = dgl.graph((edge_index[0], edge_index[1])).to(device)
+    graphs.append(G)
+
+#这里是边特征，用create_edge.py中的建立EdgeFeats_predicted_CA_17_181.pkl，包含各个边的两个特征，边的来源是distance_matrixs
+save_edgefeats_path = root_dir + 'dataset_dir_train_186_164_test_71/train_315/edge_features/EdgeFeats_predicted_SC_17_181.pkl'##################
+with open(save_edgefeats_path, 'rb') as f:
+    efeats = pickle.load(f)
+
+train_dic = {"ID": IDs, "sequence": sequences, "label": labels,'features':features,'coors':coors,'adj':adjs,'graph':graphs,'efeats':efeats}
+
+dataframe = pd.DataFrame(train_dic)
+
+
+class dataSet(data.Dataset):
+
+    def __init__(self,dataframe,adjs):
+        self.names = dataframe['ID'].values
+        self.sequences = dataframe['sequence'].values
+        self.labels = dataframe['label'].values
+        self.features = dataframe['features'].values
+        self.coors = dataframe['coors'].values     #坐标
+        self.graphs =  dataframe['graph'].values   #邻接构建的图
+        self.efeats = dataframe['efeats'].values   #边特征
+        self.adj = dataframe['adj'].values         #邻接
+
+    def __getitem__(self,index):
+        sequence_name = self.names[index]
+        sequence = self.sequences[index]
+        label = self.labels[index]
+        node_features = self.features[index]
+        coors = self.coors
+        coor = coors[index]
+        graphs = self.graphs
+        graph = graphs[index]
+        adj = self.adj[index]
+
+        efeat = self.efeats[index]
+
+        return sequence_name,sequence,label,node_features,graph,efeat,adj,coor
+
+    def __len__(self):
+
+        return len(self.labels)
+
+
+def graph_collate(samples):
+    _,_,label_batch, node_features_batch, graph_batch,efeat_batch,adj_batch,coors_batch = map(list, zip(*samples))
+    graph_batch = dgl.batch(graph_batch)
+
+    return label_batch, node_features_batch, graph_batch,efeat_batch,adj_batch,coors_batch
+
+
+
+def train_one_epoch(model,data_loader):
+    epoch_loss_train = 0.0
+    n = 0
+
+    for label_batch, node_features_batch, graph_batch,efeat_batch,adj_batch,coors_batch in data_loader:
+
+        model.optimizer.zero_grad()
+        node_features_batch = torch.tensor(node_features_batch)
+        coors_batch = torch.tensor(coors_batch)
+        adj_batch = adj_batch[0]
+        label_batch = label_batch[0]
+        efeat_batch = efeat_batch[0]
+
+        if torch.cuda.is_available():
+            node_features_batch = Variable(node_features_batch.cuda())
+            graph_batch = graph_batch.to(device)
+            efeat_batch = efeat_batch.to(device)
+            adj_batch = Variable(adj_batch.cuda())
+            coors_batch = Variable(coors_batch.cuda())
+            y_true = label_batch
+        else:
+            node_features_batch = Variable(node_features_batch)
+            graph_batch = graph_batch
+            adj_batch = Variable(adj_batch)
+            coors_batch = Variable(coors_batch)
+            y_true = label_batch
+            efeat_batch = efeat_batch
+
+        # print('node_features',node_features_batch.shape)
+        # print('graph',graph_batch)
+        # print('adj',adj_batch.shape)
+        # print('coors',coors_batch.shape)
+        # print('y',len(y_true))
+        # print('efeats',efeat_batch.shape)
+
+        y_pred = model(graph_batch, node_features_batch,coors_batch,adj_batch,efeat_batch)
+        y_pred = torch.squeeze(y_pred)
+        y_pred = torch.sigmoid(y_pred)
+
+        # true labels
+        y_true_int = [int(label) for label in y_true]
+        labels = torch.tensor(y_true_int,dtype=torch.float32,device=device)
+
+        loss = model.criterion(y_pred, labels)
+        loss.backward()  # backward gradient
+
+        model.optimizer.step()  # update all parameters
+
+        epoch_loss_train += loss.item()
+        n += 1
+
+    print('training time',n)
+    epoch_loss_train_avg = epoch_loss_train / n
+
+    return epoch_loss_train_avg
+
+
+def evaluate(model,data_loader):
+
+    model.eval()
+
+    epoch_loss = 0.0
+    n = 0
+    valid_pred = []
+    valid_true = []
+    pred_dict = []
+
+    for label_batch, node_features_batch, graph_batch,efeat_batch,adj_batch,coors_batch in data_loader:
+
+        with torch.no_grad():
+
+            node_features_batch = torch.tensor(node_features_batch)
+            coors_batch = torch.tensor(coors_batch)
+            adj_batch = adj_batch[0]
+            label_batch = label_batch[0]
+            efeat_batch = efeat_batch[0]
+
+            if torch.cuda.is_available():
+                node_features_batch = Variable(node_features_batch.cuda())
+                graph_batch = graph_batch.to(device)
+                efeat_batch = efeat_batch.to(device)
+                adj_batch = Variable(adj_batch.cuda())
+                coors_batch = Variable(coors_batch.cuda())
+                y_true = label_batch
+            else:
+                node_features_batch = Variable(node_features_batch)
+                graph_batch = graph_batch
+                adj_batch = Variable(adj_batch)
+                coors_batch = Variable(coors_batch)
+                y_true = label_batch
+                efeat_batch = efeat_batch
+
+            y_pred = model(graph_batch, node_features_batch, coors_batch, adj_batch, efeat_batch)
+
+            softmax = torch.nn.Softmax(dim=1)
+            y_pred = softmax(y_pred)
+            y_pred = torch.squeeze(y_pred)
+
+            y_true_int = [int(label) for label in y_true]
+            y_true = torch.tensor(y_true_int, dtype=torch.float32, device=device)
+
+            loss = model.criterion(y_pred,y_true)
+
+            y_pred = y_pred.cpu().detach().numpy()
+            y_true = y_true.cpu().detach().numpy()
+
+            # valid_pred += [pred[1] for pred in y_pred]
+            valid_pred += [pred for pred in y_pred]
+            valid_true += list(y_true)
+
+            epoch_loss += loss.item()
+            n += 1
+
+    epoch_loss_avg = epoch_loss / n
+    print('evaluate time', n)
+
+    return epoch_loss_avg,valid_true,valid_pred
+
+
+def analysis(y_true,y_pred,best_threshold = None):
+
+    if best_threshold == None:
+        best_mcc = 0
+        best_threshold = 0
+
+        for j in range(0, 100):
+            threshold = j / 100000  # pls change this threshold according to your code
+            binary_pred = [1 if pred >= threshold else 0 for pred in y_pred]
+            binary_true = y_true
+            mcc = matthews_corrcoef(binary_true, binary_pred)
+
+            if mcc > best_mcc:
+                best_mcc = mcc
+                best_threshold = threshold
+    # print('best_threshold',best_threshold)
+    binary_pred = [1.0 if pred >= best_threshold else 0.0 for pred in y_pred]
+
+    # correct_samples = (binary_pred == y_true).sum().item()
+    correct_samples = sum(a == b for a, b in zip(binary_pred, y_true))
+    accuracy = correct_samples / len(y_true)
+
+    pre = precision_score(y_true, binary_pred, zero_division=0)
+    recall = recall_score(y_true, binary_pred, zero_division=0)
+    f1 = f1_score(y_true, binary_pred, zero_division=0)
+    mcc = matthews_corrcoef(y_true, binary_pred)
+    auc = roc_auc_score(y_true, y_pred)
+    pr_auc = average_precision_score(y_true, y_pred)
+
+    tn, fp, fn, tp = confusion_matrix(y_true, binary_pred).ravel()
+    spe = tn / (tn + fp)
+
+    results = {
+        'accuracy':accuracy,
+        'spe':spe,
+        'precision': pre,
+        'recall': recall,
+        'f1':f1,
+        'mcc': mcc,
+        'auc':auc,
+        'pr_auc':pr_auc,
+        'thred':best_threshold
+    }
+
+    return results
+
+
+def train_1(model,train_dataframe,valid_dataframe,fold = 0):
+
+    train_dataSet = dataSet(dataframe=train_dataframe, adjs=adjs)
+    train_loader = torch.utils.data.DataLoader(train_dataSet,batch_size=1,shuffle=True,collate_fn=graph_collate)
+
+    valid_dataSet = dataSet(dataframe=valid_dataframe, adjs=adjs)
+    valid_loader = torch.utils.data.DataLoader(valid_dataSet, batch_size=1, shuffle=True, collate_fn=graph_collate)
+
+    best_epoch = 0
+    best_val_acc = 0
+    best_val_spe = 0
+    best_val_pre = 0
+    best_val_recall = 0
+    best_val_f1 = 0
+    best_val_mcc = 0
+    best_val_auc = 0
+    best_val_prauc = 0
+
+    for epoch in range(NUMBER_EPOCHS):
+
+
+        print("\n========== Train epoch " + str(epoch + 1) + " ==========")
+        print("Current time:", datetime.now())
+        model.train()
+
+        begin_time = time.time()
+        epoch_loss_train_avg = train_one_epoch(model, train_loader)
+        end_time = time.time()
+        run_time = end_time - begin_time
+
+        print("========== Evaluate Valid set ==========")
+        epoch_loss_valid_avg, valid_true, valid_pred = evaluate(model, valid_loader)
+        valid_results = analysis(valid_true, valid_pred)
+        print("Valid loss: ", epoch_loss_valid_avg)
+        print("Valid accuracy: ", valid_results['accuracy'])
+        print("Valid spe: ", valid_results['spe'])
+        print("Valid precision: ", valid_results['precision'])
+        print("Valid recall: ", valid_results['recall'])
+        print("Valid f1: ", valid_results['f1'])
+        print("Valid mcc: ", valid_results['mcc'])
+        print("Valid auc: ", valid_results['auc'])
+        print("Valid pr_auc: ", valid_results['pr_auc'])
+        print("Running Time: ", run_time)
+
+        if best_val_prauc < valid_results['pr_auc']:
+            best_epoch = epoch + 1
+            best_val_mcc = valid_results['mcc']
+            best_val_acc = valid_results['accuracy']
+            best_val_spe = valid_results['spe']
+            best_val_pre = valid_results['precision']
+            best_val_recall = valid_results['recall']
+            best_val_f1 = valid_results['f1']
+            best_val_auc = valid_results['auc']
+            best_val_prauc = valid_results['pr_auc']
+
+            print('-' * 20, "new best pr_auc:{0}".format(best_val_prauc), '-' * 20)
+            torch.save(model.state_dict(), os.path.join(Model_Path, 'Fold' + str(fold) + 'predicted_edgeFeats_best_AUPR_model.pkl'))
+
+    return best_epoch,best_val_mcc,best_val_acc,best_val_spe,best_val_pre,best_val_recall,best_val_f1,best_val_auc,best_val_prauc
+
+
+def cross_validation(all_dataframe,fold_number = 5):
+
+    sequence_names = all_dataframe['ID'].values
+    sequence_labels = all_dataframe['label'].values
+    kfold = KFold(n_splits=fold_number, shuffle=True)
+    fold = 0
+
+    best_epochs = []
+    valid_accs = []
+    valid_spes = []
+    valid_recalls = []
+    valid_mccs = []
+    valid_f1s = []
+    valid_pres = []
+    valid_aucs = []
+    valid_pr_aucs = []
+
+    for train_index,valid_index in kfold.split(sequence_names,sequence_labels):
+
+        print("\n\n========== Fold " + str(fold + 1) + " ==========")
+        train_dataframe = all_dataframe.iloc[train_index, :]
+        valid_dataframe = all_dataframe.iloc[valid_index, :]
+        print("Train on", str(train_dataframe.shape[0]),"samples, validate on",str(valid_dataframe.shape[0]),"samples")
+
+        # PSSM 20,Atomic features 7, SS 14 /one-hot 20 /protrans 1024 /ESM2 5120
+        model = MainModel(dr,lr,nlayers,lamda,alpha,atten_time,nfeats=41+20+1024+5120)
+        # model = MainModel(dr, lr, nlayers, lamda, alpha, atten_time, nfeats=41 + 20 + 1024 + 5120)
+        model.to(device)
+        # if torch.cuda.is_available():
+        #     model.cuda()
+
+        best_epoch,valid_mcc,val_acc,val_spe,val_pre,val_recall,val_f1,val_auc,val_pr_auc = train_1(model,train_dataframe,valid_dataframe,fold+1)
+        best_epochs.append(str(best_epoch))
+        valid_mccs.append(valid_mcc)
+        valid_accs.append(val_acc)
+        valid_spes.append(val_spe)
+        valid_pres.append(val_pre)
+        valid_recalls.append(val_recall)
+        valid_f1s.append(val_f1)
+        valid_aucs.append(val_auc)
+        valid_pr_aucs.append(val_pr_auc)
+
+        fold += 1
+
+    print("\n\nBest epoch: " + " ".join(best_epochs))
+    print("Average MCC of {} fold：{:.4f}".format(fold_number, max(valid_mccs)))
+    print("Average acc of {} fold：{:.4f}".format(fold_number, max(valid_accs)))
+    print("Average spe of {} fold：{:.4f}".format(fold_number, max(valid_spes)))
+    print("Average pre of {} fold：{:.4f}".format(fold_number, max(valid_pres)))
+    print("Average recall of {} fold：{:.4f}".format(fold_number, max(valid_recalls)))
+    print("Average f1 of {} fold：{:.4f}".format(fold_number, max(valid_f1s)))
+    print("Average auc of {} fold：{:.4f}".format(fold_number, max(valid_aucs)))
+    print("Average pr_auc of {} fold：{:.4f}".format(fold_number, max(valid_pr_aucs)))
+
+    return round(sum([int(epoch) for epoch in best_epochs]) / fold_number)
+
+
+aver_epoch = cross_validation(dataframe, fold_number = 5)
+
+#nohup python -u train_val_bestAUPR_predicted.py > /home/mijia/egpdi_evolla/log/AF3_SC_egnn_gcn2_multihead_8.log 2>&1 &
